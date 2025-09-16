@@ -1,0 +1,328 @@
+UDP bidirectional client/server (single cross-platform Python script)
+
+Below is a single Python program that can run as a server or a client.
+It uses UDP, but adds a lightweight acknowledgement (ACK + retransmit) so messages are reliably delivered in practice. Both sides can send messages from their terminal and receive messages at the same time. Works on Linux and Windows (Python 3.8+).
+
+Save as udp_bidir.py and run with --mode server or --mode client. Example usage is shown after the code.
+
+#!/usr/bin/env python3
+"""
+udp_bidir.py
+
+Run as a server:
+    python udp_bidir.py --mode server --host 0.0.0.0 --port 9999
+
+Run as a client:
+    python udp_bidir.py --mode client --host 127.0.0.1 --port 9999
+
+Both sides can type messages; each message will be acknowledged by the remote side.
+"""
+
+import argparse
+import json
+import socket
+import threading
+import uuid
+import time
+import sys
+
+# Config: retransmit attempts and timeout (seconds)
+RETRANSMIT_ATTEMPTS = 5
+ACK_TIMEOUT = 1.0
+
+# Message types
+MSG_TYPE = "MSG"
+ACK_TYPE = "ACK"
+
+def make_msg(msg_type, msg_id, payload=""):
+    return json.dumps({
+        "type": msg_type,
+        "id": msg_id,
+        "payload": payload
+    }).encode("utf-8")
+
+def parse_msg(data):
+    try:
+        obj = json.loads(data.decode("utf-8"))
+        return obj
+    except Exception:
+        return None
+
+class UdpPeer:
+    def __init__(self, local_host, local_port, remote_host=None, remote_port=None, name="peer"):
+        self.local = (local_host, local_port)
+        self.remote = (remote_host, remote_port) if remote_host and remote_port else None
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Allow reusing address quickly on Linux/Windows
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            # On Windows, SO_REUSEADDR doesn't allow multiple binds on same port, but it's safe here.
+            self.sock.bind(self.local)
+        except Exception as e:
+            print("Failed to bind to {}: {}".format(self.local, e))
+            raise
+        self.name = name
+
+        # pending ack events: id -> threading.Event
+        self.pending = {}
+        self.pending_lock = threading.Lock()
+        # store responses payloads for received msgs (optional)
+        self.received_messages = []
+        self.running = True
+
+    def send_with_ack(self, payload, remote=None):
+        """
+        Send payload (string) to remote (tuple host,port) or default remote.
+        Retransmit until ACK received or attempts exhausted.
+        Returns True if ACK received, False otherwise.
+        """
+        if remote is None:
+            if self.remote is None:
+                raise ValueError("No remote specified for sending.")
+            remote = self.remote
+
+        msg_id = str(uuid.uuid4())
+        msg_bytes = make_msg(MSG_TYPE, msg_id, payload)
+
+        # event to wait on for ack
+        ev = threading.Event()
+        with self.pending_lock:
+            self.pending[msg_id] = {"event": ev, "payload": payload}
+
+        success = False
+        try:
+            for attempt in range(1, RETRANSMIT_ATTEMPTS + 1):
+                try:
+                    self.sock.sendto(msg_bytes, remote)
+                except Exception as e:
+                    print(f"[{self.name}] send error: {e}")
+                    break
+                # wait for ack
+                got = ev.wait(timeout=ACK_TIMEOUT)
+                if got:
+                    success = True
+                    break
+                else:
+                    print(f"[{self.name}] no ACK for id {msg_id}, attempt {attempt}/{RETRANSMIT_ATTEMPTS}")
+            if not success:
+                print(f"[{self.name}] failed to get ACK for id {msg_id} after {RETRANSMIT_ATTEMPTS} attempts")
+        finally:
+            with self.pending_lock:
+                self.pending.pop(msg_id, None)
+        return success
+
+    def _handle_incoming(self, data, addr):
+        parsed = parse_msg(data)
+        if not parsed:
+            print(f"[{self.name}] received malformed data from {addr}: {data!r}")
+            return
+
+        mtype = parsed.get("type")
+        mid = parsed.get("id")
+        payload = parsed.get("payload", "")
+
+        if mtype == MSG_TYPE:
+            # Received a message; print and ACK back
+            print(f"\n[{self.name}] <{addr}>: {payload}\n> ", end="", flush=True)
+            # store
+            self.received_messages.append((addr, payload, mid))
+            # send ACK
+            ack_bytes = make_msg(ACK_TYPE, mid, "")
+            try:
+                self.sock.sendto(ack_bytes, addr)
+            except Exception as e:
+                print(f"[{self.name}] failed to send ACK to {addr}: {e}")
+
+        elif mtype == ACK_TYPE:
+            # Received an ACK; notify the waiting event if exists
+            with self.pending_lock:
+                entry = self.pending.get(mid)
+            if entry:
+                entry["event"].set()
+            else:
+                # unexpected ACK (maybe late) - ignore or log
+                # print(f"[{self.name}] unexpected ACK for id {mid} from {addr}")
+                pass
+        else:
+            print(f"[{self.name}] unknown message type from {addr}: {mtype}")
+
+    def receive_loop(self):
+        self.sock.settimeout(0.5)
+        while self.running:
+            try:
+                data, addr = self.sock.recvfrom(65536)
+                # handle in separate thread to avoid blocking receive loop
+                threading.Thread(target=self._handle_incoming, args=(data, addr), daemon=True).start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"[{self.name}] receive error: {e}")
+                break
+
+    def input_loop(self, default_remote=None):
+        """
+        Read input from stdin and send. User can type:
+          - "/send host port message" to send to arbitrary host:port
+          - "/peer host port" to set default remote
+          - or just type message to send to default remote
+        """
+        print(f"[{self.name}] ready. Type messages and press Enter to send.")
+        print("Commands:")
+        print("  /peer HOST PORT     - set default remote peer")
+        print("  /send HOST PORT MSG - send a single message to HOST:PORT")
+        print("  /quit               - exit")
+        while self.running:
+            try:
+                # prompt
+                msg = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nExiting input loop.")
+                self.running = False
+                break
+
+            if not msg:
+                continue
+
+            if msg.startswith("/peer"):
+                parts = msg.split()
+                if len(parts) >= 3:
+                    try:
+                        h = parts[1]
+                        p = int(parts[2])
+                        self.remote = (h, p)
+                        print(f"Default remote set to {self.remote}")
+                    except ValueError:
+                        print("Invalid port.")
+                else:
+                    print("Usage: /peer HOST PORT")
+                continue
+
+            if msg.startswith("/send"):
+                parts = msg.split(maxsplit=3)
+                if len(parts) >= 4:
+                    try:
+                        h = parts[1]
+                        p = int(parts[2])
+                        msg_payload = parts[3]
+                        ok = self.send_with_ack(msg_payload, remote=(h, p))
+                        if ok:
+                            print(f"[{self.name}] message delivered to {(h,p)}")
+                        else:
+                            print(f"[{self.name}] failed to deliver to {(h,p)}")
+                    except ValueError:
+                        print("Invalid usage. Usage: /send HOST PORT MSG")
+                else:
+                    print("Usage: /send HOST PORT MSG")
+                continue
+
+            if msg == "/quit":
+                print("Quitting.")
+                self.running = False
+                break
+
+            # default send
+            if self.remote is None:
+                print("No default remote set. Use /peer HOST PORT or /send.")
+                continue
+
+            ok = self.send_with_ack(msg)
+            if ok:
+                print(f"[{self.name}] message delivered to {self.remote}")
+            else:
+                print(f"[{self.name}] delivery to {self.remote} failed.")
+
+    def close(self):
+        self.running = False
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+def main():
+    parser = argparse.ArgumentParser(description="Simple bidirectional UDP with ACKs")
+    parser.add_argument("--mode", choices=["server", "client"], required=True)
+    parser.add_argument("--host", default="0.0.0.0", help="Local bind host (server binds here; client binds here too).")
+    parser.add_argument("--port", type=int, default=9999, help="Local bind port.")
+    parser.add_argument("--remote-host", help="Remote host to send to (client).")
+    parser.add_argument("--remote-port", type=int, help="Remote port to send to (client).")
+    args = parser.parse_args()
+
+    name = args.mode
+    peer = UdpPeer(args.host, args.port, args.remote_host, args.remote_port, name=name)
+
+    # Start receiver loop
+    recv_thread = threading.Thread(target=peer.receive_loop, daemon=True)
+    recv_thread.start()
+
+    # For server: if remote not provided, print instruction
+    if args.mode == "server":
+        print(f"[server] bound to {peer.local}. Waiting for incoming messages. If you want to send, set /peer HOST PORT.")
+    else:
+        if peer.remote:
+            print(f"[client] default remote is {peer.remote}")
+        else:
+            print("[client] no default remote. Use /peer HOST PORT to set one or /send HOST PORT MSG to directly send.")
+
+    try:
+        peer.input_loop()
+    except KeyboardInterrupt:
+        print("Interrupted by keyboard.")
+    finally:
+        peer.close()
+        recv_thread.join(timeout=1)
+
+if __name__ == "__main__":
+    main()
+
+How it works (brief)
+
+Runs the same code for server or client (set --mode).
+
+Uses UDP sockets and a JSON message format: {"type":"MSG"|"ACK","id":"<uuid>","payload":"..."}.
+
+When you send a message, the sender waits for an ACK for that message id. If no ACK arrives inside ACK_TIMEOUT, it retransmits up to RETRANSMIT_ATTEMPTS.
+
+When a peer receives a MSG, it prints it and sends back an ACK immediately.
+
+Receiver runs in a background thread; input loop runs in main thread so you can type messages while receiving.
+
+Examples
+
+Start server (Linux or Windows PowerShell/cmd):
+
+python udp_bidir.py --mode server --host 0.0.0.0 --port 9999
+
+
+Start client on same machine:
+
+python udp_bidir.py --mode client --host 0.0.0.0 --port 9998 --remote-host 127.0.0.1 --remote-port 9999
+
+
+The client binds to local port 9998 and will send to 127.0.0.1:9999.
+
+On the server terminal you can type /peer 127.0.0.1 9998 to set its default remote and then type messages the server will send to the client.
+
+Or from another machine, use the server's public IP and proper firewall/NAT rules:
+
+On server: python udp_bidir.py --mode server --host 0.0.0.0 --port 9999
+
+On client: python udp_bidir.py --mode client --host 0.0.0.0 --port 9998 --remote-host <server-ip> --remote-port 9999
+
+Notes & improvements you might want
+
+This is best-effort reliability on top of UDP (simple ACK + retransmit). It is not TCP; duplicates are possible and not deduplicated other than by the ACK lifecycle.
+
+If you want ordering, deduplication, or large payload fragmentation, add sequence numbers, sliding window, and chunk reassembly.
+
+For production, consider using select/asyncio for scalability or QUIC/TCP if you want built-in reliability.
+
+Works cross-platform; ensure Windows firewall allows Python to bind/receive on the chosen port.
+
+If you want, I can:
+
+Add message ordering / deduplication.
+
+Provide an asyncio version.
+
+Wrap into two separate files (server.py / client.py) with same behavior.
